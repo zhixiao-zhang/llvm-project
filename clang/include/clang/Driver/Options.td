@@ -570,6 +570,11 @@ def gen_reproducer: Flag<["-"], "gen-reproducer">, InternalDebugOpt,
 def gen_cdb_fragment_path: Separate<["-"], "gen-cdb-fragment-path">, InternalDebugOpt,
   HelpText<"Emit a compilation database fragment to the specified directory">;
 
+defm raw2fat_global_provenance : BoolFOption<"raw2fat-global-provenance",
+  CodeGenOpts<"Raw2FatGlobalProvenance">, DefaultFalse,
+  PosFlag<SetTrue, [CC1Option],
+          "Emit semantic global pointer initializer provenance for Raw2Fat">,
+  NegFlag<SetFalse>>;
 def round_trip_args : Flag<["-"], "round-trip-args">, Flags<[CC1Option, NoDriverOption]>,
   HelpText<"Enable command line arguments round-trip.">;
 def no_round_trip_args : Flag<["-"], "no-round-trip-args">, Flags<[CC1Option, NoDriverOption]>,

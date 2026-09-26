@@ -40,6 +40,9 @@ private:
   /// Whether we're in a constant context.
   bool InConstantContext = false;
 
+  /// The declaration whose initializer is currently being emitted.
+  const VarDecl *InitializerDecl = nullptr;
+
   /// The AST address space where this (non-abstract) initializer is going.
   /// Used for generating appropriate placeholders.
   LangAS DestAddressSpace;

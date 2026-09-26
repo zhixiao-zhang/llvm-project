@@ -29,6 +29,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalVariable.h"
+#include <limits>
 using namespace clang;
 using namespace CodeGen;
 
@@ -1435,6 +1436,9 @@ ConstantEmitter::emitAbstract(SourceLocation loc, const APValue &value,
 
 llvm::Constant *ConstantEmitter::tryEmitForInitializer(const VarDecl &D) {
   initializeNonAbstract(D.getType().getAddressSpace());
+  if (!D.hasLocalStorage() &&
+      D.getDeclContext()->isTranslationUnit())
+    InitializerDecl = &D;
   return markIfFailed(tryEmitPrivateForVarInit(D));
 }
 
@@ -1609,6 +1613,237 @@ namespace {
   };
 }
 
+// Find the LLVM pointer constant at the source initializer byte offset.
+static llvm::Constant *findInitializerPointerLeaf(
+    llvm::Constant *C, uint64_t SourceOffset, uint64_t SourcePointerSize,
+    const llvm::DataLayout &DL, llvm::SmallVectorImpl<unsigned> &Path) {
+  uint64_t Offset = 0;
+  while (C) {
+    llvm::Type *Ty = C->getType();
+    if (!Ty->isSized() || SourceOffset < Offset)
+      return nullptr;
+    llvm::TypeSize Size = DL.getTypeAllocSize(Ty);
+    if (Size.isScalable() || SourceOffset - Offset >= Size.getFixedValue())
+      return nullptr;
+    if (Ty->isPointerTy())
+      return Offset == SourceOffset &&
+                     Size.getFixedValue() == SourcePointerSize
+                 ? C
+                 : nullptr;
+
+    uint64_t I;
+    uint64_t ChildOffset;
+    if (auto *ST = llvm::dyn_cast<llvm::StructType>(Ty)) {
+      const llvm::StructLayout *Layout = DL.getStructLayout(ST);
+      unsigned Field =
+          Layout->getElementContainingOffset(SourceOffset - Offset);
+      if (Field >= ST->getNumElements())
+        return nullptr;
+      ChildOffset = Layout->getElementOffset(Field);
+      if (ChildOffset > UINT64_MAX - Offset)
+        return nullptr;
+      ChildOffset += Offset;
+      I = Field;
+    } else if (auto *AT = llvm::dyn_cast<llvm::ArrayType>(Ty)) {
+      llvm::TypeSize ElementSize = DL.getTypeAllocSize(AT->getElementType());
+      if (ElementSize.isScalable() || !ElementSize.getFixedValue())
+        return nullptr;
+      uint64_t Stride = ElementSize.getFixedValue();
+      I = (SourceOffset - Offset) / Stride;
+      if (I >= AT->getNumElements() ||
+          I > std::numeric_limits<unsigned>::max() ||
+          I > (UINT64_MAX - Offset) / Stride)
+        return nullptr;
+      ChildOffset = Offset + Stride * I;
+    } else {
+      return nullptr;
+    }
+    Path.push_back(static_cast<unsigned>(I));
+    Offset = ChildOffset;
+    C = C->getAggregateElement(static_cast<unsigned>(I));
+  }
+  return nullptr;
+}
+
+static void emitGlobalInitializerPointerProvenance(
+    CodeGenModule &CGM, llvm::GlobalVariable *global, bool InConstantContext,
+    llvm::NamedMDNode *NMD, const Expr *E, QualType T, uint64_t SourceOffset) {
+
+  if (!E)
+    return;
+  T = T.getCanonicalType().getUnqualifiedType();
+  const Expr *InitExpr = E->IgnoreParenImpCasts();
+  if (T->isArrayType() || T->isRecordType()) {
+    auto *ILE = dyn_cast<InitListExpr>(InitExpr);
+    if (!ILE)
+      return;
+    if (!ILE->isSemanticForm())
+      ILE = ILE->getSemanticForm();
+    if (T->isRecordType()) {
+      const RecordDecl *RD = T->getAsRecordDecl();
+      if (!RD || RD->isUnion() || !RD->isStruct())
+        return;
+    } else if (!CGM.getContext().getAsConstantArrayType(T)) {
+      return;
+    }
+    const RecordDecl *RD = T->isRecordType() ? T->getAsRecordDecl() : nullptr;
+    RecordDecl::field_iterator Field;
+    RecordDecl::field_iterator FieldEnd;
+    if (RD) {
+      Field = RD->field_begin();
+      FieldEnd = RD->field_end();
+    }
+    for (unsigned I = 0; I < ILE->getNumInits(); ++I) {
+      QualType ChildType;
+      const FieldDecl *SelectedField = nullptr;
+      uint64_t ChildOffset = SourceOffset;
+      if (T->isArrayType()) {
+        ChildType = T->getAsArrayTypeUnsafe()->getElementType();
+        uint64_t Stride =
+            CGM.getContext().getTypeSizeInChars(ChildType).getQuantity();
+        if (Stride && I > (UINT64_MAX - ChildOffset) / Stride)
+          return;
+        ChildOffset += Stride * I;
+      } else {
+        while (Field != FieldEnd && Field->isUnnamedBitfield())
+          ++Field;
+        if (Field == FieldEnd)
+          return;
+        SelectedField = *Field++;
+        ChildType = SelectedField->getType();
+        uint64_t FieldOffset =
+            CGM.getContext()
+                .getASTRecordLayout(T->getAsRecordDecl())
+                .getFieldOffset(SelectedField->getFieldIndex()) /
+            CGM.getContext().getCharWidth();
+        if (FieldOffset > UINT64_MAX - ChildOffset)
+          return;
+        ChildOffset += FieldOffset;
+      }
+      emitGlobalInitializerPointerProvenance(CGM, global, InConstantContext,
+                                             NMD, ILE->getInit(I), ChildType,
+                                             ChildOffset);
+    }
+    return;
+  }
+  if (!T->isPointerType() || T->getPointeeType()->isFunctionType())
+    return;
+  Expr::EvalResult Eval;
+  if (!E->EvaluateAsRValue(Eval, CGM.getContext(), InConstantContext) ||
+      Eval.HasSideEffects || !Eval.Val.isLValue() ||
+      !Eval.Val.hasLValuePath())
+    return;
+  const APValue &V = Eval.Val;
+  if (V.isNullPointer())
+    return;
+  auto Base = V.getLValueBase();
+  const auto *TargetDecl = Base.dyn_cast<const ValueDecl *>();
+  const auto *TargetVD = dyn_cast_or_null<VarDecl>(TargetDecl);
+  if (!TargetVD || TargetVD->hasLocalStorage() ||
+      TargetVD->getType().getAddressSpace() != LangAS::Default)
+    return;
+  llvm::Constant *TargetAddr = CGM.GetAddrOfGlobalVar(TargetVD);
+  TargetAddr = TargetAddr->stripPointerCasts();
+  auto *TargetGV = dyn_cast<llvm::GlobalVariable>(TargetAddr);
+  if (!TargetGV)
+    return;
+
+  llvm::SmallVector<llvm::Metadata *, 8> TargetOps;
+  QualType TargetTy = TargetVD->getType();
+  uint64_t ReplayedOffset = 0;
+  for (const APValue::LValuePathEntry &Entry : V.getLValuePath()) {
+    unsigned Kind;
+    uint64_t Index;
+    if (TargetTy->isRecordType()) {
+      const RecordDecl *TargetRD = TargetTy->getAsRecordDecl();
+      if (!TargetRD || TargetRD->isUnion())
+        return;
+      auto BM = Entry.getAsBaseOrMember();
+      const auto *FD = dyn_cast_or_null<FieldDecl>(BM.getPointer());
+      if (!FD)
+        return;
+      Kind = 0;
+      Index = CGM.getTypes()
+                  .getCGRecordLayout(FD->getParent())
+                  .getLLVMFieldNo(FD);
+      uint64_t FieldOffset = CGM.getContext()
+                                 .getASTRecordLayout(FD->getParent())
+                                 .getFieldOffset(FD->getFieldIndex()) /
+                             CGM.getContext().getCharWidth();
+      if (FieldOffset > UINT64_MAX - ReplayedOffset)
+        return;
+      ReplayedOffset += FieldOffset;
+      TargetTy = FD->getType();
+    } else if (TargetTy->isArrayType()) {
+      if (!CGM.getContext().getAsConstantArrayType(TargetTy))
+        return;
+      Kind = 1;
+      Index = Entry.getAsArrayIndex();
+      uint64_t Stride =
+          CGM.getContext()
+              .getTypeSizeInChars(
+                  TargetTy->getAsArrayTypeUnsafe()->getElementType())
+              .getQuantity();
+      if ((Stride && Index > UINT64_MAX / Stride) ||
+          Stride * Index > UINT64_MAX - ReplayedOffset)
+        return;
+      ReplayedOffset += Stride * Index;
+      TargetTy = TargetTy->getAsArrayTypeUnsafe()->getElementType();
+    } else {
+      return;
+    }
+    llvm::Metadata *Pair[] = {
+        llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(CGM.Int32Ty, Kind)),
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+            llvm::Type::getInt64Ty(CGM.getLLVMContext()), Index))};
+    TargetOps.push_back(llvm::MDNode::get(CGM.getLLVMContext(), Pair));
+  }
+  if (V.isLValueOnePastTheEnd()) {
+    uint64_t Size =
+        CGM.getContext().getTypeSizeInChars(TargetTy).getQuantity();
+    if (Size > UINT64_MAX - ReplayedOffset)
+      return;
+    ReplayedOffset += Size;
+  }
+  if (V.getLValueOffset().getQuantity() < 0 ||
+      ReplayedOffset !=
+          static_cast<uint64_t>(V.getLValueOffset().getQuantity()))
+    return;
+  uint64_t SourcePointerSize =
+      CGM.getContext().getTypeSizeInChars(T).getQuantity();
+  llvm::SmallVector<unsigned, 8> InitPath;
+  llvm::Constant *InitLeaf = findInitializerPointerLeaf(
+      global->getInitializer(), SourceOffset, SourcePointerSize,
+      CGM.getDataLayout(), InitPath);
+  if (!InitLeaf)
+    return;
+  llvm::SmallVector<llvm::Metadata *, 8> InitOps;
+  for (unsigned Index : InitPath)
+    InitOps.push_back(llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(CGM.Int32Ty, Index)));
+  llvm::APInt InitOffset(
+      CGM.getDataLayout().getIndexTypeSizeInBits(InitLeaf->getType()), 0,
+      true);
+  const llvm::Value *InitBase = InitLeaf->stripAndAccumulateConstantOffsets(
+      CGM.getDataLayout(), InitOffset,
+      /*AllowNonInbounds=*/true);
+  if (InitBase != TargetGV || InitOffset.isNegative() ||
+      InitOffset.getActiveBits() > 64 ||
+      InitOffset.getZExtValue() != ReplayedOffset)
+    return;
+  llvm::Metadata *Ops[] = {
+      llvm::MDString::get(CGM.getLLVMContext(), "v2"),
+      llvm::ConstantAsMetadata::get(global),
+      llvm::MDNode::get(CGM.getLLVMContext(), InitOps),
+      llvm::ConstantAsMetadata::get(TargetGV),
+      llvm::MDNode::get(CGM.getLLVMContext(), TargetOps),
+      llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(llvm::Type::getInt1Ty(CGM.getLLVMContext()),
+                                 V.isLValueOnePastTheEnd()))};
+  NMD->addOperand(llvm::MDNode::get(CGM.getLLVMContext(), Ops));
+}
+
 void ConstantEmitter::finalize(llvm::GlobalVariable *global) {
   assert(InitializedNonAbstract &&
          "finalizing emitter that was used for abstract emission?");
@@ -1617,6 +1852,16 @@ void ConstantEmitter::finalize(llvm::GlobalVariable *global) {
 
   // Note that we might also be Failed.
   Finalized = true;
+
+  if (CGM.getCodeGenOpts().Raw2FatGlobalProvenance && InitializerDecl &&
+      !CGM.getLangOpts().CPlusPlus && InitializerDecl->isFileVarDecl() &&
+      InitializerDecl->getInit()) {
+    auto *NMD = CGM.getModule().getOrInsertNamedMetadata(
+        "raw2fat.global_initializer_pointers");
+    emitGlobalInitializerPointerProvenance(CGM, global, InConstantContext, NMD,
+                                           InitializerDecl->getInit(),
+                                           InitializerDecl->getType(), 0);
+  }
 
   if (!PlaceholderAddresses.empty()) {
     ReplacePlaceholders(CGM, global, PlaceholderAddresses)
