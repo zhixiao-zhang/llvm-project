@@ -902,6 +902,8 @@ void CodeGenModule::Release() {
 
   SimplifyPersonality();
 
+  Types.emitRaw2FatFunctionPointerFieldTypes();
+
   if (getCodeGenOpts().EmitDeclMetadata)
     EmitDeclMetadata();
 

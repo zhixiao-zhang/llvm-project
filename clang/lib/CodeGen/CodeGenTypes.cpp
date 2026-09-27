@@ -922,6 +922,73 @@ CodeGenTypes::getCGRecordLayout(const RecordDecl *RD) {
   return *I->second;
 }
 
+static bool compareRecordTypeNames(
+    const std::pair<const Type *, llvm::StructType *> &A,
+    const std::pair<const Type *, llvm::StructType *> &B) {
+  return A.second->getName() < B.second->getName();
+}
+
+void CodeGenTypes::emitRaw2FatFunctionPointerFieldTypes() {
+  if (TheModule.getContext().supportsTypedPointers()) {
+    SmallVector<std::pair<const Type *, llvm::StructType *>, 16> Records;
+    for (const auto &Entry : RecordDeclTypes)
+      Records.push_back(Entry);
+    llvm::sort(Records, compareRecordTypeNames);
+
+    llvm::NamedMDNode *Metadata = nullptr;
+    for (const auto &Entry : Records) {
+      const auto *RecordTy = dyn_cast<RecordType>(Entry.first);
+      if (!RecordTy)
+        continue;
+      const RecordDecl *RD = RecordTy->getDecl()->getDefinition();
+      if (!RD || RD->isUnion() || Entry.second->isOpaque())
+        continue;
+      auto LayoutIt = CGRecordLayouts.find(Entry.first);
+      if (LayoutIt == CGRecordLayouts.end())
+        continue;
+
+      const CGRecordLayout &Layout = *LayoutIt->second;
+      llvm::StructType *OwnerTy = Entry.second;
+      for (const FieldDecl *FD : RD->fields()) {
+        QualType FieldTy = FD->getType();
+        if (!FieldTy->isFunctionPointerType())
+          continue;
+        unsigned FieldIndex = Layout.getLLVMFieldNo(FD);
+        auto *StoragePointerTy =
+            dyn_cast<llvm::PointerType>(OwnerTy->getElementType(FieldIndex));
+        if (!StoragePointerTy || StoragePointerTy->isOpaquePointerTy() ||
+            StoragePointerTy->getAddressSpace() != 0)
+          continue;
+        auto *StorageStructTy = dyn_cast<llvm::StructType>(
+            StoragePointerTy->getNonOpaquePointerElementType());
+        if (!StorageStructTy || StorageStructTy->isOpaque() ||
+            StorageStructTy->getNumElements() != 0)
+          continue;
+
+        QualType FunctionTy = FieldTy->getPointeeType();
+        llvm::Type *LoweredTy = ConvertFunctionTypeInternal(
+            Context.getCanonicalType(FunctionTy));
+        auto *LoweredFunctionTy = dyn_cast<llvm::FunctionType>(LoweredTy);
+        if (!LoweredFunctionTy)
+          continue;
+
+        if (!Metadata)
+          Metadata = TheModule.getOrInsertNamedMetadata(
+              "raw2fat.fptr_field_types");
+        llvm::Metadata *Operands[] = {
+            llvm::MDString::get(TheModule.getContext(), "v1"),
+            llvm::ConstantAsMetadata::get(llvm::ConstantPointerNull::get(
+                llvm::PointerType::get(OwnerTy, 0))),
+            llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(TheModule.getContext()), FieldIndex)),
+            llvm::ConstantAsMetadata::get(llvm::ConstantPointerNull::get(
+                llvm::PointerType::get(LoweredFunctionTy, 0)))};
+        Metadata->addOperand(llvm::MDNode::get(TheModule.getContext(), Operands));
+      }
+    }
+  }
+}
+
 bool CodeGenTypes::isPointerZeroInitializable(QualType T) {
   assert((T->isAnyPointerType() || T->isBlockPointerType()) && "Invalid type");
   return isZeroInitializable(T);

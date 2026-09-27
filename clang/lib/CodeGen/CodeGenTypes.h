@@ -155,6 +155,9 @@ public:
 
   const CGRecordLayout &getCGRecordLayout(const RecordDecl*);
 
+  /// Emit declaration evidence for function-pointer fields lowered to {}*.
+  void emitRaw2FatFunctionPointerFieldTypes();
+
   /// UpdateCompletedType - When we find the full definition for a TagDecl,
   /// replace the 'opaque' type we previously made for it if applicable.
   void UpdateCompletedType(const TagDecl *TD);
