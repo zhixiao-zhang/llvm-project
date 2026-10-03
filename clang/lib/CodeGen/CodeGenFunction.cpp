@@ -2505,6 +2505,130 @@ void CodeGenFunction::InsertHelper(llvm::Instruction *I,
   LoopStack.InsertHelper(I);
   if (IsSanitizerScope)
     CGM.getSanitizerMetadata()->disableSanitizerForInstruction(I);
+  if (!Raw2FatPendingSizeof.empty())
+    raw2fatTagSizeofOperands(I);
+}
+
+bool CodeGenFunction::raw2fatSizeofProvenanceEnabled() const {
+  return CGM.getCodeGenOpts().Raw2FatSizeofProvenance;
+}
+
+static bool isRaw2FatTransparentExpr(const Expr *E) {
+  return isa<ImplicitCastExpr>(E) || isa<ParenExpr>(E);
+}
+
+/// The innermost expression on the stack other than parentheses and
+/// implicit casts, skipping \p Skip entries from the top first.
+static const Expr *
+getRaw2FatEnclosingExpr(ArrayRef<const Expr *> Stack, size_t Skip) {
+  for (size_t I = Stack.size(); I > Skip; --I)
+    if (!isRaw2FatTransparentExpr(Stack[I - Skip - 1]))
+      return Stack[I - Skip - 1];
+  return nullptr;
+}
+
+void CodeGenFunction::raw2fatPushExpr(const Expr *E) {
+  Raw2FatExprStack.push_back(E);
+}
+
+void CodeGenFunction::raw2fatPopExpr(const Expr *E) {
+  assert(!Raw2FatExprStack.empty() && Raw2FatExprStack.back() == E &&
+         "unbalanced Raw2Fat expression stack");
+  Raw2FatExprStack.pop_back();
+  // A value its parent did not consume was folded into another constant or
+  // discarded; it must not mark a later equal literal.
+  llvm::erase_if(Raw2FatPendingSizeof,
+                 [E](const Raw2FatSizeofUse &U) { return U.Parent == E; });
+}
+
+/// Whether \p Ty is a record, or an array of records, that holds a pointer:
+/// the types whose size Raw2Fat may change.
+static bool isRaw2FatSizedRecordType(llvm::Type *Ty) {
+  while (auto *ATy = dyn_cast<llvm::ArrayType>(Ty))
+    Ty = ATy->getElementType();
+  auto *STy = dyn_cast<llvm::StructType>(Ty);
+  if (!STy)
+    return false;
+  llvm::SmallVector<llvm::Type *, 8> Worklist{STy};
+  llvm::SmallPtrSet<llvm::Type *, 8> Seen;
+  while (!Worklist.empty()) {
+    llvm::Type *Cur = Worklist.pop_back_val();
+    if (!Seen.insert(Cur).second)
+      continue;
+    if (Cur->isPointerTy())
+      return true;
+    if (auto *CurSTy = dyn_cast<llvm::StructType>(Cur))
+      Worklist.append(CurSTy->element_begin(), CurSTy->element_end());
+    else if (auto *CurATy = dyn_cast<llvm::ArrayType>(Cur))
+      Worklist.push_back(CurATy->getElementType());
+  }
+  return false;
+}
+
+void CodeGenFunction::raw2fatRecordSizeof(const UnaryExprOrTypeTraitExpr *E,
+                                          llvm::Value *Size) {
+  auto *C = dyn_cast<llvm::ConstantInt>(Size);
+  if (!C || E->getKind() != UETT_SizeOf)
+    return;
+  QualType TypeToSize = E->getTypeOfArgument();
+  if (TypeToSize->isIncompleteType() || TypeToSize->isDependentType())
+    return;
+  llvm::Type *SizedTy = ConvertTypeForMem(TypeToSize);
+  if (!isRaw2FatSizedRecordType(SizedTy))
+    return;
+  // The top of the stack is E itself.
+  const Expr *Parent = getRaw2FatEnclosingExpr(Raw2FatExprStack, 1);
+  if (!Parent)
+    return;
+  Raw2FatPendingSizeof.push_back({C, SizedTy, Parent});
+}
+
+void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
+  const Expr *Current = getRaw2FatEnclosingExpr(Raw2FatExprStack, 0);
+  if (!Current)
+    return;
+  llvm::LLVMContext &Ctx = I->getContext();
+  llvm::SmallVector<llvm::Metadata *, 8> Ops;
+  if (llvm::MDNode *Old = I->getMetadata("raw2fat.sizeof"))
+    Ops.append(Old->op_begin(), Old->op_end());
+  else
+    Ops.push_back(llvm::MDString::get(Ctx, "v1"));
+  bool Tagged = false;
+  for (auto It = Raw2FatPendingSizeof.begin();
+       It != Raw2FatPendingSizeof.end();) {
+    if (It->Parent != Current) {
+      ++It;
+      continue;
+    }
+    // An implicit integral conversion may have changed the width, so match
+    // the value.
+    uint64_t Value = It->Value->getZExtValue();
+    int Operand = -1;
+    unsigned Matches = 0;
+    for (unsigned OpNo = 0, E = I->getNumOperands(); OpNo != E; ++OpNo) {
+      auto *C = dyn_cast<llvm::ConstantInt>(I->getOperand(OpNo));
+      if (C && C->getBitWidth() <= 64 && C->getZExtValue() == Value) {
+        Operand = OpNo;
+        ++Matches;
+      }
+    }
+    if (Matches == 0) {
+      ++It;
+      continue;
+    }
+    // An equal literal in the same instruction makes the operand ambiguous;
+    // leave it unmarked.
+    if (Matches == 1) {
+      Ops.push_back(llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), Operand)));
+      Ops.push_back(llvm::ConstantAsMetadata::get(
+          llvm::ConstantPointerNull::get(It->SizedTy->getPointerTo())));
+      Tagged = true;
+    }
+    It = Raw2FatPendingSizeof.erase(It);
+  }
+  if (Tagged)
+    I->setMetadata("raw2fat.sizeof", llvm::MDNode::get(Ctx, Ops));
 }
 
 void CGBuilderInserter::InsertHelper(

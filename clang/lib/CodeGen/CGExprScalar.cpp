@@ -405,7 +405,12 @@ public:
 
   Value *Visit(Expr *E) {
     ApplyDebugLocation DL(CGF, E);
-    return StmtVisitor<ScalarExprEmitter, Value*>::Visit(E);
+    if (!CGF.raw2fatSizeofProvenanceEnabled())
+      return StmtVisitor<ScalarExprEmitter, Value*>::Visit(E);
+    CGF.raw2fatPushExpr(E);
+    Value *V = StmtVisitor<ScalarExprEmitter, Value*>::Visit(E);
+    CGF.raw2fatPopExpr(E);
+    return V;
   }
 
   Value *VisitStmt(Stmt *S) {
@@ -3003,7 +3008,10 @@ ScalarExprEmitter::VisitUnaryExprOrTypeTraitExpr(
 
   // If this isn't sizeof(vla), the result must be constant; use the constant
   // folding logic so we don't have to duplicate it here.
-  return Builder.getInt(E->EvaluateKnownConstInt(CGF.getContext()));
+  Value *Size = Builder.getInt(E->EvaluateKnownConstInt(CGF.getContext()));
+  if (CGF.raw2fatSizeofProvenanceEnabled())
+    CGF.raw2fatRecordSizeof(E, Size);
+  return Size;
 }
 
 Value *ScalarExprEmitter::VisitUnaryReal(const UnaryOperator *E) {

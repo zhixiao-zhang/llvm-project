@@ -575,6 +575,12 @@ defm raw2fat_global_provenance : BoolFOption<"raw2fat-global-provenance",
   PosFlag<SetTrue, [CC1Option],
           "Emit semantic global pointer initializer provenance for Raw2Fat">,
   NegFlag<SetFalse>>;
+defm raw2fat_sizeof_provenance : BoolFOption<"raw2fat-sizeof-provenance",
+  CodeGenOpts<"Raw2FatSizeofProvenance">, DefaultFalse,
+  PosFlag<SetTrue, [CC1Option],
+          "Mark instruction operands that come from sizeof of a pointer-holding "
+          "record for Raw2Fat">,
+  NegFlag<SetFalse>>;
 def round_trip_args : Flag<["-"], "round-trip-args">, Flags<[CC1Option, NoDriverOption]>,
   HelpText<"Enable command line arguments round-trip.">;
 def no_round_trip_args : Flag<["-"], "no-round-trip-args">, Flags<[CC1Option, NoDriverOption]>,

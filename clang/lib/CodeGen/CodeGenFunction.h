@@ -315,6 +315,30 @@ public:
                     llvm::BasicBlock *BB,
                     llvm::BasicBlock::iterator InsertPt) const;
 
+  /// Raw2Fat sizeof provenance (-fraw2fat-sizeof-provenance).
+  ///
+  /// sizeof of a record that holds pointers is emitted as a plain constant,
+  /// which loses its meaning as soon as an instruction consumes it. The
+  /// instruction that consumes it while its parent expression is emitted
+  /// gets !raw2fat.sizeof naming the operand and the record type, so Raw2Fat
+  /// can use the record's rewritten size. The IR itself is unchanged.
+  struct Raw2FatSizeofUse {
+    llvm::ConstantInt *Value;
+    llvm::Type *SizedTy;
+    /// The nearest enclosing expression other than parentheses and implicit
+    /// casts; only an instruction emitted for it consumes the value.
+    const Expr *Parent;
+  };
+  /// Expressions being emitted by ScalarExprEmitter, innermost last.
+  mutable llvm::SmallVector<const Expr *, 16> Raw2FatExprStack;
+  mutable llvm::SmallVector<Raw2FatSizeofUse, 4> Raw2FatPendingSizeof;
+  bool raw2fatSizeofProvenanceEnabled() const;
+  void raw2fatPushExpr(const Expr *E);
+  void raw2fatPopExpr(const Expr *E);
+  void raw2fatRecordSizeof(const UnaryExprOrTypeTraitExpr *E,
+                           llvm::Value *Size);
+  void raw2fatTagSizeofOperands(llvm::Instruction *I) const;
+
   /// CurFuncDecl - Holds the Decl for the current outermost
   /// non-closure context.
   const Decl *CurFuncDecl;
