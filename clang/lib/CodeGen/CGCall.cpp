@@ -3503,6 +3503,8 @@ void CodeGenFunction::EmitFunctionEpilog(const CGFunctionInfo &FI,
   }
 
   llvm::DebugLoc RetDbgLoc;
+  // Set when the store to the return value carrying it is folded away.
+  llvm::MDNode *Raw2FatSizeofMD = nullptr;
   llvm::Value *RV = nullptr;
   QualType RetTy = FI.getReturnType();
   const ABIArgInfo &RetAI = FI.getReturnInfo();
@@ -3571,8 +3573,10 @@ void CodeGenFunction::EmitFunctionEpilog(const CGFunctionInfo &FI,
         // instruction.
         if (EmitRetDbgLoc && !AutoreleaseResult)
           RetDbgLoc = SI->getDebugLoc();
-        // Get the stored value and nuke the now-dead store.
+        // Get the stored value and nuke the now-dead store. A sizeof mark on
+        // the stored value (operand 0) moves to the return.
         RV = SI->getValueOperand();
+        Raw2FatSizeofMD = SI->getMetadata("raw2fat.sizeof");
         SI->eraseFromParent();
 
       // Otherwise, we have to do a simple load.
@@ -3666,6 +3670,8 @@ void CodeGenFunction::EmitFunctionEpilog(const CGFunctionInfo &FI,
     }
     EmitReturnValueCheck(RV);
     Ret = Builder.CreateRet(RV);
+    if (Raw2FatSizeofMD)
+      Ret->setMetadata("raw2fat.sizeof", Raw2FatSizeofMD);
   } else {
     Ret = Builder.CreateRetVoid();
   }

@@ -62,6 +62,38 @@ void ambiguous(void) { use(32, sizeof(struct group)); }
 // CHECK: call i8* @alloc(i64 noundef 32), !raw2fat.sizeof ![[ALLOC:[0-9]+]]
 void *allocate(void) { return alloc(sizeof(struct group)); }
 
+// A full expression is consumed by the store or return that follows it; the
+// operand is 0 in both, so the node equals the call-argument one.
+// With one return, the store to the return value folds into the ret, and the
+// mark moves with it.
+// CHECK-LABEL: define{{.*}} i64 @return_one(
+// CHECK: ret i64 32, !raw2fat.sizeof ![[ALLOC]]
+size_t return_one(void) { return sizeof(struct group); }
+
+// With several returns, each store to the return value is marked.
+// CHECK-LABEL: define{{.*}} i64 @return_choice(
+// CHECK: store i64 32, i64* %retval{{.*}}, !raw2fat.sizeof ![[ALLOC]]
+// CHECK: store i64 32, i64* %retval{{.*}}{{$}}
+size_t return_choice(int k) {
+  if (k)
+    return sizeof(struct group);
+  return sizeof(struct plain);
+}
+
+// CHECK-LABEL: define{{.*}} i64 @initialize(
+// CHECK: store i64 32, i64* %n{{.*}}, !raw2fat.sizeof ![[ALLOC]]
+size_t initialize(void) {
+  size_t n = sizeof(struct group);
+  return n;
+}
+
+// A statement-level call is not on the expression stack; the next
+// instruction is the call itself, which is no store or return, so an equal
+// literal among its other arguments is not taken for the sizeof.
+// CHECK-LABEL: define{{.*}} void @statement_call(
+// CHECK: call void @use(i64 noundef 32, i64 noundef 32){{$}}
+void statement_call(void) { use(sizeof(struct group), 32); }
+
 // CHECK-DAG: ![[GROUP]] = !{!"v1", i32 1, %struct.group* null}
 // CHECK-DAG: ![[ARRAY]] = !{!"v1", i32 1, [2 x %struct.group]* null}
 // CHECK-DAG: ![[ALLOC]] = !{!"v1", i32 0, %struct.group* null}

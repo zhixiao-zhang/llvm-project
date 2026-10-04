@@ -2576,17 +2576,20 @@ void CodeGenFunction::raw2fatRecordSizeof(const UnaryExprOrTypeTraitExpr *E,
   llvm::Type *SizedTy = ConvertTypeForMem(TypeToSize);
   if (!isRaw2FatSizedRecordType(SizedTy))
     return;
-  // The top of the stack is E itself.
+  // The top of the stack is E itself. Without an enclosing expression, E is
+  // a full expression (return value, initializer).
   const Expr *Parent = getRaw2FatEnclosingExpr(Raw2FatExprStack, 1);
-  if (!Parent)
-    return;
   Raw2FatPendingSizeof.push_back({C, SizedTy, Parent});
 }
 
 void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
   const Expr *Current = getRaw2FatEnclosingExpr(Raw2FatExprStack, 0);
-  if (!Current)
-    return;
+  // A full-expression value is consumed by the next instruction that is not
+  // an intrinsic, and only when that is a store of it or a return of it:
+  // `return sizeof (T);` or `size_t n = sizeof (T);`. Anything else, such as
+  // a call evaluating another argument, could hold an equal literal.
+  bool IsIntrinsic = isa<llvm::IntrinsicInst>(I);
+  bool ConsumesFullExpression = isa<llvm::StoreInst>(I) || isa<llvm::ReturnInst>(I);
   llvm::LLVMContext &Ctx = I->getContext();
   llvm::SmallVector<llvm::Metadata *, 8> Ops;
   if (llvm::MDNode *Old = I->getMetadata("raw2fat.sizeof"))
@@ -2596,7 +2599,16 @@ void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
   bool Tagged = false;
   for (auto It = Raw2FatPendingSizeof.begin();
        It != Raw2FatPendingSizeof.end();) {
-    if (It->Parent != Current) {
+    if (!It->Parent) {
+      if (IsIntrinsic) {
+        ++It;
+        continue;
+      }
+      if (!ConsumesFullExpression) {
+        It = Raw2FatPendingSizeof.erase(It);
+        continue;
+      }
+    } else if (!Current || It->Parent != Current) {
       ++It;
       continue;
     }
@@ -2613,7 +2625,11 @@ void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
       }
     }
     if (Matches == 0) {
-      ++It;
+      // A full-expression value expires at its first consumer candidate.
+      if (!It->Parent)
+        It = Raw2FatPendingSizeof.erase(It);
+      else
+        ++It;
       continue;
     }
     // An equal literal in the same instruction makes the operand ambiguous;

@@ -326,7 +326,9 @@ public:
     llvm::ConstantInt *Value;
     llvm::Type *SizedTy;
     /// The nearest enclosing expression other than parentheses and implicit
-    /// casts; only an instruction emitted for it consumes the value.
+    /// casts; only an instruction emitted for it consumes the value. Null for
+    /// a full expression such as a return value or an initializer, which the
+    /// next store or return consumes.
     const Expr *Parent;
   };
   /// Expressions being emitted by ScalarExprEmitter, innermost last.
