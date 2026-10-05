@@ -322,9 +322,14 @@ public:
   /// instruction that consumes it while its parent expression is emitted
   /// gets !raw2fat.sizeof naming the operand and the record type, so Raw2Fat
   /// can use the record's rewritten size. The IR itself is unchanged.
+  /// offsetof into such a record is tracked the same way and marks its
+  /// consumer with !raw2fat.offsetof; the operand is the source offset.
+  /// An operand number -1 - N names operand N of a GEP that holds the negated
+  /// value, as pointer minus integer emits it.
   struct Raw2FatSizeofUse {
     llvm::ConstantInt *Value;
     llvm::Type *SizedTy;
+    bool IsOffsetof;
     /// The nearest enclosing expression other than parentheses and implicit
     /// casts; only an instruction emitted for it consumes the value. Null for
     /// a full expression such as a return value or an initializer, which the
@@ -339,6 +344,7 @@ public:
   void raw2fatPopExpr(const Expr *E);
   void raw2fatRecordSizeof(const UnaryExprOrTypeTraitExpr *E,
                            llvm::Value *Size);
+  void raw2fatRecordOffsetof(const OffsetOfExpr *E, llvm::Value *Offset);
   void raw2fatTagSizeofOperands(llvm::Instruction *I) const;
 
   /// CurFuncDecl - Holds the Decl for the current outermost

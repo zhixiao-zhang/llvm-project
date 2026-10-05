@@ -2882,8 +2882,10 @@ Value *ScalarExprEmitter::VisitOffsetOfExpr(OffsetOfExpr *E) {
   // Try folding the offsetof to a constant.
   Expr::EvalResult EVResult;
   if (E->EvaluateAsInt(EVResult, CGF.getContext())) {
-    llvm::APSInt Value = EVResult.Val.getInt();
-    return Builder.getInt(Value);
+    llvm::Value *Offset = Builder.getInt(EVResult.Val.getInt());
+    if (CGF.raw2fatSizeofProvenanceEnabled())
+      CGF.raw2fatRecordOffsetof(E, Offset);
+    return Offset;
   }
 
   // Loop over the components of the offsetof to compute the value.

@@ -2579,7 +2579,24 @@ void CodeGenFunction::raw2fatRecordSizeof(const UnaryExprOrTypeTraitExpr *E,
   // The top of the stack is E itself. Without an enclosing expression, E is
   // a full expression (return value, initializer).
   const Expr *Parent = getRaw2FatEnclosingExpr(Raw2FatExprStack, 1);
-  Raw2FatPendingSizeof.push_back({C, SizedTy, Parent});
+  Raw2FatPendingSizeof.push_back({C, SizedTy, /*IsOffsetof=*/false, Parent});
+}
+
+void CodeGenFunction::raw2fatRecordOffsetof(const OffsetOfExpr *E,
+                                            llvm::Value *Offset) {
+  // The first member stays at offset 0, and a zero literal is too common to
+  // match its consumer reliably.
+  auto *C = dyn_cast<llvm::ConstantInt>(Offset);
+  if (!C || C->isZero())
+    return;
+  QualType RecordTy = E->getTypeSourceInfo()->getType();
+  if (RecordTy->isIncompleteType() || RecordTy->isDependentType())
+    return;
+  llvm::Type *SizedTy = ConvertTypeForMem(RecordTy);
+  if (!isRaw2FatSizedRecordType(SizedTy))
+    return;
+  const Expr *Parent = getRaw2FatEnclosingExpr(Raw2FatExprStack, 1);
+  Raw2FatPendingSizeof.push_back({C, SizedTy, /*IsOffsetof=*/true, Parent});
 }
 
 void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
@@ -2591,12 +2608,16 @@ void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
   bool IsIntrinsic = isa<llvm::IntrinsicInst>(I);
   bool ConsumesFullExpression = isa<llvm::StoreInst>(I) || isa<llvm::ReturnInst>(I);
   llvm::LLVMContext &Ctx = I->getContext();
-  llvm::SmallVector<llvm::Metadata *, 8> Ops;
-  if (llvm::MDNode *Old = I->getMetadata("raw2fat.sizeof"))
-    Ops.append(Old->op_begin(), Old->op_end());
-  else
-    Ops.push_back(llvm::MDString::get(Ctx, "v1"));
-  bool Tagged = false;
+  // [0] collects !raw2fat.sizeof, [1] !raw2fat.offsetof.
+  static const char *const MDNames[] = {"raw2fat.sizeof", "raw2fat.offsetof"};
+  llvm::SmallVector<llvm::Metadata *, 8> Ops[2];
+  for (unsigned K = 0; K != 2; ++K) {
+    if (llvm::MDNode *Old = I->getMetadata(MDNames[K]))
+      Ops[K].append(Old->op_begin(), Old->op_end());
+    else
+      Ops[K].push_back(llvm::MDString::get(Ctx, "v1"));
+  }
+  bool Tagged[2] = {false, false};
   for (auto It = Raw2FatPendingSizeof.begin();
        It != Raw2FatPendingSizeof.end();) {
     if (!It->Parent) {
@@ -2624,6 +2645,20 @@ void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
         ++Matches;
       }
     }
+    // Pointer minus integer negates the constant before the GEP consumes it:
+    // (char *)p - offsetof (T, m) becomes gep i8, p, -Value. Such an operand
+    // is recorded as -1 - OpNo.
+    if (Matches == 0 && isa<llvm::GetElementPtrInst>(I) && Value != 0 &&
+        Value <= uint64_t(INT64_MAX)) {
+      for (unsigned OpNo = 1, E = I->getNumOperands(); OpNo != E; ++OpNo) {
+        auto *C = dyn_cast<llvm::ConstantInt>(I->getOperand(OpNo));
+        if (C && C->getBitWidth() <= 64 &&
+            C->getSExtValue() == -int64_t(Value)) {
+          Operand = -1 - int(OpNo);
+          ++Matches;
+        }
+      }
+    }
     if (Matches == 0) {
       // A full-expression value expires at its first consumer candidate.
       if (!It->Parent)
@@ -2635,16 +2670,18 @@ void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
     // An equal literal in the same instruction makes the operand ambiguous;
     // leave it unmarked.
     if (Matches == 1) {
-      Ops.push_back(llvm::ConstantAsMetadata::get(
+      unsigned K = It->IsOffsetof;
+      Ops[K].push_back(llvm::ConstantAsMetadata::get(
           llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), Operand)));
-      Ops.push_back(llvm::ConstantAsMetadata::get(
+      Ops[K].push_back(llvm::ConstantAsMetadata::get(
           llvm::ConstantPointerNull::get(It->SizedTy->getPointerTo())));
-      Tagged = true;
+      Tagged[K] = true;
     }
     It = Raw2FatPendingSizeof.erase(It);
   }
-  if (Tagged)
-    I->setMetadata("raw2fat.sizeof", llvm::MDNode::get(Ctx, Ops));
+  for (unsigned K = 0; K != 2; ++K)
+    if (Tagged[K])
+      I->setMetadata(MDNames[K], llvm::MDNode::get(Ctx, Ops[K]));
 }
 
 void CGBuilderInserter::InsertHelper(
