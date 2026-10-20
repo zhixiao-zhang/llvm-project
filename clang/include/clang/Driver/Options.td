@@ -570,6 +570,12 @@ def gen_reproducer: Flag<["-"], "gen-reproducer">, InternalDebugOpt,
 def gen_cdb_fragment_path: Separate<["-"], "gen-cdb-fragment-path">, InternalDebugOpt,
   HelpText<"Emit a compilation database fragment to the specified directory">;
 
+defm raw2fat_anonymous_record_names : BoolFOption<"raw2fat-anonymous-record-names",
+  CodeGenOpts<"Raw2FatAnonymousRecordNames">, DefaultFalse,
+  PosFlag<SetTrue, [CC1Option],
+          "Name untagged records after their members so that the IR linker "
+          "merges them only across compatible declarations">,
+  NegFlag<SetFalse>>;
 defm raw2fat_global_provenance : BoolFOption<"raw2fat-global-provenance",
   CodeGenOpts<"Raw2FatGlobalProvenance">, DefaultFalse,
   PosFlag<SetTrue, [CC1Option],

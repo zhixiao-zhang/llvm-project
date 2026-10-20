@@ -25,6 +25,8 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Module.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/xxhash.h"
 
 using namespace clang;
 using namespace CodeGen;
@@ -44,6 +46,36 @@ CodeGenTypes::~CodeGenTypes() {
 
 const CodeGenOptions &CodeGenTypes::getCodeGenOpts() const {
   return CGM.getCodeGenOpts();
+}
+
+// Print the members of an untagged record. Two untagged records from separate
+// translation units are compatible exactly when their members match in name,
+// type and order (C11 6.2.7), so the printed members identify the source type.
+// Untagged member records are printed in place, and tag locations are left
+// out, so the result does not depend on where a header was included.
+static void printAnonymousRecordMembers(const RecordDecl *RD,
+                                        const PrintingPolicy &Policy,
+                                        raw_ostream &OS) {
+  const ASTContext &Ctx = RD->getASTContext();
+  OS << RD->getKindName() << '{';
+  for (const FieldDecl *FD : RD->fields()) {
+    OS << FD->getName() << ':';
+    QualType T = FD->getType().getCanonicalType();
+    while (const auto *AT = Ctx.getAsConstantArrayType(T)) {
+      OS << '[' << AT->getSize() << ']';
+      T = AT->getElementType().getCanonicalType();
+    }
+    const RecordDecl *Member = T->getAsRecordDecl();
+    if (Member && !Member->getIdentifier() &&
+        !Member->getTypedefNameForAnonDecl() && Member->getDefinition())
+      printAnonymousRecordMembers(Member->getDefinition(), Policy, OS);
+    else
+      T.print(OS, Policy);
+    if (FD->isBitField())
+      OS << ':' << FD->getBitWidthValue(Ctx);
+    OS << ';';
+  }
+  OS << '}';
 }
 
 void CodeGenTypes::addRecordTypeName(const RecordDecl *RD,
@@ -75,6 +107,18 @@ void CodeGenTypes::addRecordTypeName(const RecordDecl *RD,
       TDD->printQualifiedName(OS, Policy);
     else
       TDD->printName(OS);
+  } else if (const RecordDecl *Def = RD->getDefinition();
+             Def && getCodeGenOpts().Raw2FatAnonymousRecordNames) {
+    // The IR linker merges isomorphic types only when their names agree, so
+    // name an untagged record after its members. Perl's sv_u, spelled by one
+    // macro in every SV head, keeps one type, while XOPRETANY's members and
+    // any other untagged union { char *... } get a type of their own.
+    PrintingPolicy MemberPolicy = Policy;
+    MemberPolicy.AnonymousTagLocations = false;
+    SmallString<256> Members;
+    llvm::raw_svector_ostream MembersOS(Members);
+    printAnonymousRecordMembers(Def, MemberPolicy, MembersOS);
+    OS << "anon_" << llvm::utohexstr(llvm::xxHash64(Members.str()));
   } else
     OS << "anon";
 
