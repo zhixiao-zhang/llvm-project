@@ -12,6 +12,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/FunctionExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include <functional>
 
 namespace llvm {
@@ -28,7 +29,10 @@ class IRMover {
     struct KeyTy {
       ArrayRef<Type *> ETypes;
       bool IsPacked;
-      KeyTy(ArrayRef<Type *> E, bool P);
+      /// The type name without the suffixes LLVMContext appends on a
+      /// collision. Isomorphic types merge only when these agree.
+      StringRef NamePrefix;
+      KeyTy(ArrayRef<Type *> E, bool P, StringRef Name);
       KeyTy(const StructType *ST);
       bool operator==(const KeyTy &that) const;
       bool operator!=(const KeyTy &that) const;
@@ -56,7 +60,8 @@ public:
     void addNonOpaque(StructType *Ty);
     void switchToNonOpaque(StructType *Ty);
     void addOpaque(StructType *Ty);
-    StructType *findNonOpaque(ArrayRef<Type *> ETypes, bool IsPacked);
+    StructType *findNonOpaque(ArrayRef<Type *> ETypes, bool IsPacked,
+                              StringRef Name);
     bool hasType(StructType *Ty);
   };
 

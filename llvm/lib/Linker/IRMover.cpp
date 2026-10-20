@@ -34,6 +34,26 @@ using namespace llvm;
 // TypeMap implementation.
 //===----------------------------------------------------------------------===//
 
+static StringRef getTypeNamePrefix(StringRef Name) {
+  size_t DotPos = Name.rfind('.');
+  return (DotPos == 0 || DotPos == StringRef::npos || Name.back() == '.' ||
+          !isdigit(static_cast<unsigned char>(Name[DotPos + 1])))
+             ? Name
+             : Name.substr(0, DotPos);
+}
+
+/// The source name of a struct type: \p Name without the ".N" suffixes that
+/// LLVMContext appends when a name collides, once per module a type passed
+/// through.
+static StringRef getTypeNameBase(StringRef Name) {
+  while (true) {
+    StringRef Prefix = getTypeNamePrefix(Name);
+    if (Prefix.size() == Name.size())
+      return Name;
+    Name = Prefix;
+  }
+}
+
 namespace {
 class TypeMapTy : public ValueMapTypeRemapper {
   /// This is a mapping from a source type to a destination type to use.
@@ -327,8 +347,8 @@ Type *TypeMapTy::get(Type *Ty, SmallPtrSet<StructType *, 8> &Visited) {
       return *Entry = Ty;
     }
 
-    if (StructType *OldT =
-            DstStructTypesSet.findNonOpaque(ElementTypes, IsPacked)) {
+    if (StructType *OldT = DstStructTypesSet.findNonOpaque(
+            ElementTypes, IsPacked, STy->getName())) {
       STy->setName("");
       return *Entry = OldT;
     }
@@ -757,14 +777,6 @@ GlobalValue *IRLinker::copyGlobalValueProto(const GlobalValue *SGV,
   }
 
   return NewGV;
-}
-
-static StringRef getTypeNamePrefix(StringRef Name) {
-  size_t DotPos = Name.rfind('.');
-  return (DotPos == 0 || DotPos == StringRef::npos || Name.back() == '.' ||
-          !isdigit(static_cast<unsigned char>(Name[DotPos + 1])))
-             ? Name
-             : Name.substr(0, DotPos);
 }
 
 /// Loop over all of the linked values to compute type mappings.  For example,
@@ -1644,14 +1656,22 @@ Error IRLinker::run() {
   return linkModuleFlagsMetadata();
 }
 
-IRMover::StructTypeKeyInfo::KeyTy::KeyTy(ArrayRef<Type *> E, bool P)
-    : ETypes(E), IsPacked(P) {}
+IRMover::StructTypeKeyInfo::KeyTy::KeyTy(ArrayRef<Type *> E, bool P,
+                                         StringRef Name)
+    : ETypes(E), IsPacked(P), NamePrefix(getTypeNameBase(Name)) {}
 
 IRMover::StructTypeKeyInfo::KeyTy::KeyTy(const StructType *ST)
-    : ETypes(ST->elements()), IsPacked(ST->isPacked()) {}
+    : ETypes(ST->elements()), IsPacked(ST->isPacked()),
+      NamePrefix(ST->isLiteral() ? StringRef()
+                                 : getTypeNameBase(ST->getName())) {}
 
+// Isomorphic types with different names are different source types: C
+// requires types from separate translation units to agree in tag (C11 6.2.7),
+// and Clang names an untagged record after its members. The name stays out of
+// the hash, so renaming a type already in the set does not invalidate it.
 bool IRMover::StructTypeKeyInfo::KeyTy::operator==(const KeyTy &That) const {
-  return IsPacked == That.IsPacked && ETypes == That.ETypes;
+  return IsPacked == That.IsPacked && ETypes == That.ETypes &&
+         NamePrefix == That.NamePrefix;
 }
 
 bool IRMover::StructTypeKeyInfo::KeyTy::operator!=(const KeyTy &That) const {
@@ -1709,8 +1729,8 @@ void IRMover::IdentifiedStructTypeSet::addOpaque(StructType *Ty) {
 
 StructType *
 IRMover::IdentifiedStructTypeSet::findNonOpaque(ArrayRef<Type *> ETypes,
-                                                bool IsPacked) {
-  IRMover::StructTypeKeyInfo::KeyTy Key(ETypes, IsPacked);
+                                                bool IsPacked, StringRef Name) {
+  IRMover::StructTypeKeyInfo::KeyTy Key(ETypes, IsPacked, Name);
   auto I = NonOpaqueStructTypes.find_as(Key);
   return I == NonOpaqueStructTypes.end() ? nullptr : *I;
 }
