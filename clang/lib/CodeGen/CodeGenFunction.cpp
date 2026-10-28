@@ -2684,6 +2684,27 @@ void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
       I->setMetadata(MDNames[K], llvm::MDNode::get(Ctx, Ops[K]));
 }
 
+void CodeGenFunction::raw2fatTagAggregateCopy(llvm::Instruction *Copy,
+                                              QualType Ty, llvm::Value *Size) {
+  if (!raw2fatSizeofProvenanceEnabled())
+    return;
+  auto *C = dyn_cast<llvm::ConstantInt>(Size);
+  if (!C || Ty->isIncompleteType() || Ty->isDependentType())
+    return;
+  llvm::Type *SizedTy = ConvertTypeForMem(Ty);
+  if (!isRaw2FatSizedRecordType(SizedTy))
+    return;
+  // A copy that stops short of the tail padding is not the size of the type.
+  if (CGM.getDataLayout().getTypeAllocSize(SizedTy) != C->getZExtValue())
+    return;
+  llvm::LLVMContext &Ctx = Copy->getContext();
+  llvm::Metadata *Ops[] = {
+      llvm::MDString::get(Ctx, "v1"),
+      llvm::ConstantAsMetadata::get(
+          llvm::ConstantPointerNull::get(SizedTy->getPointerTo()))};
+  Copy->setMetadata("raw2fat.copy_type", llvm::MDNode::get(Ctx, Ops));
+}
+
 void CGBuilderInserter::InsertHelper(
     llvm::Instruction *I, const llvm::Twine &Name, llvm::BasicBlock *BB,
     llvm::BasicBlock::iterator InsertPt) const {

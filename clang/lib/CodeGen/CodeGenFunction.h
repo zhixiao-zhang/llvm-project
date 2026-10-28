@@ -346,6 +346,15 @@ public:
                            llvm::Value *Size);
   void raw2fatRecordOffsetof(const OffsetOfExpr *E, llvm::Value *Offset);
   void raw2fatTagSizeofOperands(llvm::Instruction *I) const;
+  /// An aggregate copy of a record that holds pointers is a memcpy whose
+  /// length is the record's size, with no sizeof expression to track. Record
+  /// the copied type on \p Copy as !raw2fat.copy_type = !{!"v1", T* null},
+  /// unless the copy leaves out the tail padding. Unlike !raw2fat.sizeof the
+  /// length stays a constant, so the optimizer still sees a plain copy, and
+  /// Raw2Fat uses the record only when it cannot tell the type from the
+  /// operands.
+  void raw2fatTagAggregateCopy(llvm::Instruction *Copy, QualType Ty,
+                               llvm::Value *Size);
 
   /// CurFuncDecl - Holds the Decl for the current outermost
   /// non-closure context.
