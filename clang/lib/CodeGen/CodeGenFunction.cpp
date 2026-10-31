@@ -17,6 +17,7 @@
 #include "CGCleanup.h"
 #include "CGDebugInfo.h"
 #include "CGOpenMPRuntime.h"
+#include "CGRecordLayout.h"
 #include "CodeGenModule.h"
 #include "CodeGenPGO.h"
 #include "TargetInfo.h"
@@ -2541,15 +2542,9 @@ void CodeGenFunction::raw2fatPopExpr(const Expr *E) {
                  [E](const Raw2FatSizeofUse &U) { return U.Parent == E; });
 }
 
-/// Whether \p Ty is a record, or an array of records, that holds a pointer:
-/// the types whose size Raw2Fat may change.
-static bool isRaw2FatSizedRecordType(llvm::Type *Ty) {
-  while (auto *ATy = dyn_cast<llvm::ArrayType>(Ty))
-    Ty = ATy->getElementType();
-  auto *STy = dyn_cast<llvm::StructType>(Ty);
-  if (!STy)
-    return false;
-  llvm::SmallVector<llvm::Type *, 8> Worklist{STy};
+/// Whether \p Ty is or holds a pointer.
+static bool raw2fatHoldsPointer(llvm::Type *Ty) {
+  llvm::SmallVector<llvm::Type *, 8> Worklist{Ty};
   llvm::SmallPtrSet<llvm::Type *, 8> Seen;
   while (!Worklist.empty()) {
     llvm::Type *Cur = Worklist.pop_back_val();
@@ -2565,6 +2560,49 @@ static bool isRaw2FatSizedRecordType(llvm::Type *Ty) {
   return false;
 }
 
+/// Whether \p Ty is a record, or an array of records, that holds a pointer:
+/// the types whose size Raw2Fat may change.
+static bool isRaw2FatSizedRecordType(llvm::Type *Ty) {
+  while (auto *ATy = dyn_cast<llvm::ArrayType>(Ty))
+    Ty = ATy->getElementType();
+  return isa<llvm::StructType>(Ty) && raw2fatHoldsPointer(Ty);
+}
+
+/// The record \p E is a member of, with the LLVM index path from the record
+/// to it, when \p E designates a non-bit-field member of a struct, or an
+/// element of an array member: r->data, r->data[i], *r->data. Null otherwise.
+static const RecordDecl *
+getRaw2FatMemberPath(CodeGenModule &CGM, const Expr *E,
+                     llvm::SmallVectorImpl<unsigned> &Path) {
+  // Element steps, innermost first; any element has the size of the first.
+  unsigned ElementSteps = 0;
+  E = E->IgnoreParens();
+  while (true) {
+    const Expr *Base;
+    if (const auto *ASE = dyn_cast<ArraySubscriptExpr>(E))
+      Base = ASE->getBase();
+    else if (const auto *UO = dyn_cast<UnaryOperator>(E);
+             UO && UO->getOpcode() == UO_Deref)
+      Base = UO->getSubExpr();
+    else
+      break;
+    // Only an array member's elements lie inside the record.
+    const auto *Decay = dyn_cast<ImplicitCastExpr>(Base->IgnoreParens());
+    if (!Decay || Decay->getCastKind() != CK_ArrayToPointerDecay)
+      return nullptr;
+    ++ElementSteps;
+    E = Decay->getSubExpr()->IgnoreParens();
+  }
+  const auto *ME = dyn_cast<MemberExpr>(E);
+  const auto *FD = ME ? dyn_cast<FieldDecl>(ME->getMemberDecl()) : nullptr;
+  if (!FD || FD->isBitField() || FD->getParent()->isUnion())
+    return nullptr;
+  const RecordDecl *RD = FD->getParent();
+  Path.push_back(CGM.getTypes().getCGRecordLayout(RD).getLLVMFieldNo(FD));
+  Path.append(ElementSteps, 0);
+  return RD;
+}
+
 void CodeGenFunction::raw2fatRecordSizeof(const UnaryExprOrTypeTraitExpr *E,
                                           llvm::Value *Size) {
   auto *C = dyn_cast<llvm::ConstantInt>(Size);
@@ -2574,12 +2612,21 @@ void CodeGenFunction::raw2fatRecordSizeof(const UnaryExprOrTypeTraitExpr *E,
   if (TypeToSize->isIncompleteType() || TypeToSize->isDependentType())
     return;
   llvm::Type *SizedTy = ConvertTypeForMem(TypeToSize);
-  if (!isRaw2FatSizedRecordType(SizedTy))
-    return;
+  llvm::SmallVector<unsigned, 2> MemberPath;
+  if (!isRaw2FatSizedRecordType(SizedTy)) {
+    if (E->isArgumentType() || !raw2fatHoldsPointer(SizedTy))
+      return;
+    const RecordDecl *RD =
+        getRaw2FatMemberPath(CGM, E->getArgumentExpr(), MemberPath);
+    if (!RD)
+      return;
+    SizedTy = ConvertTypeForMem(getContext().getRecordType(RD));
+  }
   // The top of the stack is E itself. Without an enclosing expression, E is
   // a full expression (return value, initializer).
   const Expr *Parent = getRaw2FatEnclosingExpr(Raw2FatExprStack, 1);
-  Raw2FatPendingSizeof.push_back({C, SizedTy, /*IsOffsetof=*/false, Parent});
+  Raw2FatPendingSizeof.push_back(
+      {C, SizedTy, /*IsOffsetof=*/false, std::move(MemberPath), Parent});
 }
 
 void CodeGenFunction::raw2fatRecordOffsetof(const OffsetOfExpr *E,
@@ -2596,7 +2643,7 @@ void CodeGenFunction::raw2fatRecordOffsetof(const OffsetOfExpr *E,
   if (!isRaw2FatSizedRecordType(SizedTy))
     return;
   const Expr *Parent = getRaw2FatEnclosingExpr(Raw2FatExprStack, 1);
-  Raw2FatPendingSizeof.push_back({C, SizedTy, /*IsOffsetof=*/true, Parent});
+  Raw2FatPendingSizeof.push_back({C, SizedTy, /*IsOffsetof=*/true, {}, Parent});
 }
 
 void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
@@ -2608,16 +2655,18 @@ void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
   bool IsIntrinsic = isa<llvm::IntrinsicInst>(I);
   bool ConsumesFullExpression = isa<llvm::StoreInst>(I) || isa<llvm::ReturnInst>(I);
   llvm::LLVMContext &Ctx = I->getContext();
-  // [0] collects !raw2fat.sizeof, [1] !raw2fat.offsetof.
-  static const char *const MDNames[] = {"raw2fat.sizeof", "raw2fat.offsetof"};
-  llvm::SmallVector<llvm::Metadata *, 8> Ops[2];
-  for (unsigned K = 0; K != 2; ++K) {
+  // [0] collects !raw2fat.sizeof, [1] !raw2fat.offsetof, and [2]
+  // !raw2fat.member_sizeof.
+  static const char *const MDNames[] = {"raw2fat.sizeof", "raw2fat.offsetof",
+                                        "raw2fat.member_sizeof"};
+  llvm::SmallVector<llvm::Metadata *, 8> Ops[3];
+  for (unsigned K = 0; K != 3; ++K) {
     if (llvm::MDNode *Old = I->getMetadata(MDNames[K]))
       Ops[K].append(Old->op_begin(), Old->op_end());
     else
       Ops[K].push_back(llvm::MDString::get(Ctx, "v1"));
   }
-  bool Tagged[2] = {false, false};
+  bool Tagged[3] = {false, false, false};
   for (auto It = Raw2FatPendingSizeof.begin();
        It != Raw2FatPendingSizeof.end();) {
     if (!It->Parent) {
@@ -2670,16 +2719,24 @@ void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
     // An equal literal in the same instruction makes the operand ambiguous;
     // leave it unmarked.
     if (Matches == 1) {
-      unsigned K = It->IsOffsetof;
+      unsigned K = It->IsOffsetof ? 1 : It->MemberPath.empty() ? 0 : 2;
+      llvm::Type *Int32Ty = llvm::Type::getInt32Ty(Ctx);
       Ops[K].push_back(llvm::ConstantAsMetadata::get(
-          llvm::ConstantInt::get(llvm::Type::getInt32Ty(Ctx), Operand)));
+          llvm::ConstantInt::get(Int32Ty, Operand)));
       Ops[K].push_back(llvm::ConstantAsMetadata::get(
           llvm::ConstantPointerNull::get(It->SizedTy->getPointerTo())));
+      if (K == 2) {
+        llvm::SmallVector<llvm::Metadata *, 2> Path;
+        for (unsigned Index : It->MemberPath)
+          Path.push_back(llvm::ConstantAsMetadata::get(
+              llvm::ConstantInt::get(Int32Ty, Index)));
+        Ops[K].push_back(llvm::MDNode::get(Ctx, Path));
+      }
       Tagged[K] = true;
     }
     It = Raw2FatPendingSizeof.erase(It);
   }
-  for (unsigned K = 0; K != 2; ++K)
+  for (unsigned K = 0; K != 3; ++K)
     if (Tagged[K])
       I->setMetadata(MDNames[K], llvm::MDNode::get(Ctx, Ops[K]));
 }

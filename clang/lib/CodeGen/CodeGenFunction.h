@@ -326,10 +326,18 @@ public:
   /// consumer with !raw2fat.offsetof; the operand is the source offset.
   /// An operand number -1 - N names operand N of a GEP that holds the negated
   /// value, as pointer minus integer emits it.
+  /// sizeof of a member that holds pointers but is no such record, such as
+  /// sizeof (r->data[0]) for a trailing `void *data[1]`, marks its consumer
+  /// with !raw2fat.member_sizeof = !{!"v1", i32 Operand, T* null,
+  /// !{i32 Index...}, ...}, naming the record and the member's index path in
+  /// it: the member's rewritten size depends on its record's layout.
   struct Raw2FatSizeofUse {
     llvm::ConstantInt *Value;
     llvm::Type *SizedTy;
     bool IsOffsetof;
+    /// For a member sizeof, the LLVM index path from SizedTy, the record, to
+    /// the member; empty otherwise.
+    llvm::SmallVector<unsigned, 2> MemberPath;
     /// The nearest enclosing expression other than parentheses and implicit
     /// casts; only an instruction emitted for it consumes the value. Null for
     /// a full expression such as a return value or an initializer, which the
