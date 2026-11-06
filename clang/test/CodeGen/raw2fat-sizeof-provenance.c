@@ -52,9 +52,10 @@ int no_pointers(size_t x) { return x > sizeof(struct plain); }
 // CHECK: add i64 %{{.*}}, 32{{$}}
 int folded(size_t n, size_t x) { return 2 * sizeof(struct group) * n + 32 > x; }
 
-// An equal literal in the same instruction makes the operand ambiguous.
+// An equal literal among a call's arguments: the value is matched by its
+// argument position, not by its value.
 // CHECK-LABEL: define{{.*}} void @ambiguous(
-// CHECK: call void @use(i64 noundef 32, i64 noundef 32){{$}}
+// CHECK: call void @use(i64 noundef 32, i64 noundef 32), !raw2fat.sizeof ![[GROUP]]
 void ambiguous(void) { use(32, sizeof(struct group)); }
 
 // A call argument is marked.
@@ -87,11 +88,10 @@ size_t initialize(void) {
   return n;
 }
 
-// A statement-level call is not on the expression stack; the next
-// instruction is the call itself, which is no store or return, so an equal
+// A statement-level call is matched by argument position too, so an equal
 // literal among its other arguments is not taken for the sizeof.
 // CHECK-LABEL: define{{.*}} void @statement_call(
-// CHECK: call void @use(i64 noundef 32, i64 noundef 32){{$}}
+// CHECK: call void @use(i64 noundef 32, i64 noundef 32), !raw2fat.sizeof ![[ALLOC]]
 void statement_call(void) { use(sizeof(struct group), 32); }
 
 // Arithmetic on a sizeof of constants stays an instruction to mark, as an

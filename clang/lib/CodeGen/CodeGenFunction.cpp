@@ -2609,6 +2609,42 @@ getRaw2FatMemberPath(CodeGenModule &CGM, const Expr *E,
   return RD;
 }
 
+/// The argument position of \p E in \p Parent when Parent is a call and E,
+/// through parentheses and implicit casts, is one of its arguments; -1
+/// otherwise.
+static int getRaw2FatCallArg(const Expr *Parent, const Expr *E) {
+  const auto *Call = dyn_cast_or_null<CallExpr>(Parent);
+  if (!Call)
+    return -1;
+  for (unsigned I = 0, N = Call->getNumArgs(); I != N; ++I)
+    if (Call->getArg(I)->IgnoreParenImpCasts() == E)
+      return I;
+  return -1;
+}
+
+/// The operand of \p I that \p U is, by its argument position when I is
+/// the call it is an argument of and that argument is still its constant;
+/// -1 otherwise.
+static int raw2fatCallArgOperand(const CodeGenFunction::Raw2FatSizeofUse &U,
+                                 const llvm::Instruction *I) {
+  const auto *Call = dyn_cast<llvm::CallBase>(I);
+  if (U.CallArg < 0 || !Call || Call->arg_size() != U.NumCallArgs)
+    return -1;
+  const auto *C = dyn_cast<llvm::ConstantInt>(Call->getArgOperand(U.CallArg));
+  if (!C || C->getBitWidth() > 64 ||
+      C->getZExtValue() != U.Value->getZExtValue())
+    return -1;
+  return U.CallArg;
+}
+
+/// Records where in its parent call \p U's value is an argument.
+static void raw2fatNoteCallArg(CodeGenFunction::Raw2FatSizeofUse &U,
+                               const Expr *E) {
+  U.CallArg = getRaw2FatCallArg(U.Parent, E);
+  if (U.CallArg >= 0)
+    U.NumCallArgs = cast<CallExpr>(U.Parent)->getNumArgs();
+}
+
 void CodeGenFunction::raw2fatRecordSizeof(const UnaryExprOrTypeTraitExpr *E,
                                           llvm::Value *Size) {
   auto *C = dyn_cast<llvm::ConstantInt>(Size);
@@ -2633,6 +2669,7 @@ void CodeGenFunction::raw2fatRecordSizeof(const UnaryExprOrTypeTraitExpr *E,
   const Expr *Parent = getRaw2FatEnclosingExpr(Raw2FatExprStack, 1);
   Raw2FatPendingSizeof.push_back(
       {C, SizedTy, /*IsOffsetof=*/false, std::move(MemberPath), Parent});
+  raw2fatNoteCallArg(Raw2FatPendingSizeof.back(), E);
 }
 
 void CodeGenFunction::raw2fatRecordOffsetof(const OffsetOfExpr *E,
@@ -2650,6 +2687,7 @@ void CodeGenFunction::raw2fatRecordOffsetof(const OffsetOfExpr *E,
     return;
   const Expr *Parent = getRaw2FatEnclosingExpr(Raw2FatExprStack, 1);
   Raw2FatPendingSizeof.push_back({C, SizedTy, /*IsOffsetof=*/true, {}, Parent});
+  raw2fatNoteCallArg(Raw2FatPendingSizeof.back(), E);
 }
 
 void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
@@ -2693,11 +2731,16 @@ void CodeGenFunction::raw2fatTagSizeofOperands(llvm::Instruction *I) const {
     uint64_t Value = It->Value->getZExtValue();
     int Operand = -1;
     unsigned Matches = 0;
-    for (unsigned OpNo = 0, E = I->getNumOperands(); OpNo != E; ++OpNo) {
-      auto *C = dyn_cast<llvm::ConstantInt>(I->getOperand(OpNo));
-      if (C && C->getBitWidth() <= 64 && C->getZExtValue() == Value) {
-        Operand = OpNo;
-        ++Matches;
+    if (int ArgNo = raw2fatCallArgOperand(*It, I); ArgNo >= 0) {
+      Operand = ArgNo;
+      Matches = 1;
+    } else {
+      for (unsigned OpNo = 0, E = I->getNumOperands(); OpNo != E; ++OpNo) {
+        auto *C = dyn_cast<llvm::ConstantInt>(I->getOperand(OpNo));
+        if (C && C->getBitWidth() <= 64 && C->getZExtValue() == Value) {
+          Operand = OpNo;
+          ++Matches;
+        }
       }
     }
     // Pointer minus integer negates the constant before the GEP consumes it:

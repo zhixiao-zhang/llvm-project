@@ -343,6 +343,12 @@ public:
     /// a full expression such as a return value or an initializer, which the
     /// next store or return consumes.
     const Expr *Parent;
+    /// When Parent is a call, the argument the value is and the call's
+    /// argument count: the call is matched by position, as an equal literal
+    /// among its other arguments, such as an offsetof beside an equal sizeof
+    /// of an element, would make a match by value ambiguous.
+    int CallArg = -1;
+    unsigned NumCallArgs = 0;
   };
   /// Expressions being emitted by ScalarExprEmitter, innermost last.
   mutable llvm::SmallVector<const Expr *, 16> Raw2FatExprStack;
