@@ -45,10 +45,10 @@ size_t array(size_t n) { return n * sizeof(struct group[2]); }
 // CHECK: icmp ugt i64 %{{.*}}, 32{{$}}
 int no_pointers(size_t x) { return x > sizeof(struct plain); }
 
-// A value folded into another constant marks nothing, and the leftover
-// record does not mark a later equal literal.
+// Arithmetic on the value stays an instruction that carries the mark, and the
+// consumed record does not mark a later equal literal.
 // CHECK-LABEL: define{{.*}} i32 @folded(
-// CHECK: mul i64 64, %{{.*}}{{$}}
+// CHECK: mul i64 2, 32, !raw2fat.sizeof ![[GROUP]]
 // CHECK: add i64 %{{.*}}, 32{{$}}
 int folded(size_t n, size_t x) { return 2 * sizeof(struct group) * n + 32 > x; }
 
@@ -93,6 +93,22 @@ size_t initialize(void) {
 // CHECK-LABEL: define{{.*}} void @statement_call(
 // CHECK: call void @use(i64 noundef 32, i64 noundef 32){{$}}
 void statement_call(void) { use(sizeof(struct group), 32); }
+
+// Arithmetic on a sizeof of constants stays an instruction to mark, as an
+// alignment macro's ((sizeof (T) + 7) >> 3) << 3.
+// CHECK-LABEL: define{{.*}} i64 @aligned_size(
+// CHECK: add i64 {{.*}}, 7{{.*}}, !raw2fat.sizeof
+size_t aligned_size(void) {
+  return ((sizeof(struct group) + 7) >> 3) << 3;
+}
+
+// A count of elements stays the constant it folds to.
+// CHECK-LABEL: define{{.*}} i64 @element_count(
+// CHECK: ret i64 3
+size_t element_count(void) {
+  struct group table[3];
+  return sizeof(table) / sizeof(table[0]);
+}
 
 // CHECK-DAG: ![[GROUP]] = !{!"v1", i32 1, %struct.group* null}
 // CHECK-DAG: ![[ARRAY]] = !{!"v1", i32 1, [2 x %struct.group]* null}

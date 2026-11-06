@@ -797,6 +797,8 @@ public:
   Value *EmitFixedPointBinOp(const BinOpInfo &Ops);
 
   BinOpInfo EmitBinOps(const BinaryOperator *E);
+  Value *emitRaw2FatUnfoldedBinOp(const BinOpInfo &Ops,
+                                   const BinaryOperator *E);
   LValue EmitCompoundAssignLValue(const CompoundAssignOperator *E,
                             Value *(ScalarExprEmitter::*F)(const BinOpInfo &),
                                   Value *&Result);
@@ -807,7 +809,10 @@ public:
   // Binary operators and binary compound assignment operators.
 #define HANDLEBINOP(OP) \
   Value *VisitBin ## OP(const BinaryOperator *E) {                         \
-    return Emit ## OP(EmitBinOps(E));                                      \
+    BinOpInfo Ops = EmitBinOps(E);                                         \
+    if (Value *Unfolded = emitRaw2FatUnfoldedBinOp(Ops, E))                \
+      return Unfolded;                                                     \
+    return Emit ## OP(Ops);                                                \
   }                                                                        \
   Value *VisitBin ## OP ## Assign(const CompoundAssignOperator *E) {       \
     return EmitCompoundAssign(E, &ScalarExprEmitter::Emit ## OP);          \
@@ -3059,6 +3064,59 @@ Value *ScalarExprEmitter::VisitUnaryImag(const UnaryOperator *E) {
 //===----------------------------------------------------------------------===//
 //                           Binary Operators
 //===----------------------------------------------------------------------===//
+
+/// Arithmetic on a sizeof or an offsetof whose other operand is also constant
+/// would fold in the IRBuilder and leave no instruction to mark, losing the
+/// provenance: an alignment macro rounds sizeof (T) up as
+/// ((sizeof (T) + 7) >> 3) << 3.
+/// Such an operation is emitted as an instruction. A division stays folded:
+/// sizeof (a) / sizeof (a[0]) is a count, which holds in any layout only as
+/// the constant it folds to.
+Value *ScalarExprEmitter::emitRaw2FatUnfoldedBinOp(const BinOpInfo &Ops,
+                                                   const BinaryOperator *E) {
+  if (!CGF.raw2fatSizeofProvenanceEnabled() ||
+      !CGF.raw2fatHasPendingSizeof(E))
+    return nullptr;
+  auto *LHS = dyn_cast<llvm::ConstantInt>(Ops.LHS);
+  auto *RHS = dyn_cast<llvm::ConstantInt>(Ops.RHS);
+  if (!LHS || !RHS)
+    return nullptr;
+  llvm::Instruction::BinaryOps Opcode;
+  switch (E->getOpcode()) {
+  case BO_Add:
+    Opcode = llvm::Instruction::Add;
+    break;
+  case BO_Sub:
+    Opcode = llvm::Instruction::Sub;
+    break;
+  case BO_Mul:
+    Opcode = llvm::Instruction::Mul;
+    break;
+  case BO_Shl:
+    Opcode = llvm::Instruction::Shl;
+    break;
+  case BO_Shr:
+    Opcode = Ops.Ty->hasUnsignedIntegerRepresentation()
+                 ? llvm::Instruction::LShr
+                 : llvm::Instruction::AShr;
+    break;
+  case BO_And:
+    Opcode = llvm::Instruction::And;
+    break;
+  case BO_Or:
+    Opcode = llvm::Instruction::Or;
+    break;
+  case BO_Xor:
+    Opcode = llvm::Instruction::Xor;
+    break;
+  default:
+    return nullptr;
+  }
+  // A shift count keeps its own type until the shift converts it.
+  llvm::Constant *Right = llvm::ConstantInt::get(
+      LHS->getType(), RHS->getValue().zextOrTrunc(LHS->getBitWidth()));
+  return Builder.Insert(llvm::BinaryOperator::Create(Opcode, LHS, Right));
+}
 
 BinOpInfo ScalarExprEmitter::EmitBinOps(const BinaryOperator *E) {
   TestAndClearIgnoreResultAssign();

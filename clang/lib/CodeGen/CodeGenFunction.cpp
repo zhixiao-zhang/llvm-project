@@ -2542,6 +2542,12 @@ void CodeGenFunction::raw2fatPopExpr(const Expr *E) {
                  [E](const Raw2FatSizeofUse &U) { return U.Parent == E; });
 }
 
+bool CodeGenFunction::raw2fatHasPendingSizeof(const Expr *E) const {
+  return llvm::any_of(Raw2FatPendingSizeof, [E](const Raw2FatSizeofUse &U) {
+    return U.Parent == E;
+  });
+}
+
 /// Whether \p Ty is or holds a pointer.
 static bool raw2fatHoldsPointer(llvm::Type *Ty) {
   llvm::SmallVector<llvm::Type *, 8> Worklist{Ty};

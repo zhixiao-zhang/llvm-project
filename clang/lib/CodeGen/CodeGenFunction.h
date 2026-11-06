@@ -350,6 +350,8 @@ public:
   bool raw2fatSizeofProvenanceEnabled() const;
   void raw2fatPushExpr(const Expr *E);
   void raw2fatPopExpr(const Expr *E);
+  /// Whether a sizeof or an offsetof waits for \p E to consume it.
+  bool raw2fatHasPendingSizeof(const Expr *E) const;
   void raw2fatRecordSizeof(const UnaryExprOrTypeTraitExpr *E,
                            llvm::Value *Size);
   void raw2fatRecordOffsetof(const OffsetOfExpr *E, llvm::Value *Offset);
